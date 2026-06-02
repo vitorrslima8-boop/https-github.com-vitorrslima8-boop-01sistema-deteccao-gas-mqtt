@@ -3,26 +3,32 @@
 #include <ESP32Servo.h>
 
 // ==========================================
-// 1. CONFIGURAÇÕES DE REDE E MQTT (A contornar a Firewall)
+// 1. CONFIGURAÇÕES DE REDE E MQTT 
 // ==========================================
 const char* ssid = "Wokwi-GUEST"; 
 const char* password = "";        
 
-// Substitua o EMQX pelo servidor da fundação Eclipse
-const char* mqtt_server = "mqtt.eclipseprojects.io";
-const int mqtt_port = 1883; // A porta do ESP32 mantém-se (os servidores do Wokwi não têm bloqueio corporativo)
-const char* topico_alerta = "gasmonitor/alerta";
+// Usando o servidor público EMQX (Mais estável e rápido)
+const char* mqtt_server = "broker.emqx.io";
+const int mqtt_port = 1883; 
+const char* topico_alerta = "gasmonitor/alerta"; 
 
 WiFiClient espClient;
 PubSubClient client(espClient);
 Servo servo;
 
 // ==========================================
-// 2. MAPEAMENTO DE HARDWARE (Pinos do ESP32 Padrão)
+// 2. MAPEAMENTO DE HARDWARE (Pinos do ESP32)
 // ==========================================
 const int pinSensor = 34; // Entrada Analógica (Sinal MQ-2)
 const int pinServo = 2;   // Saída PWM (Atuador Mecânico)
-const int pinLED = 4;     // Saída Digital (Alerta Visual Vermelho)
+const int pinLED = 4;     // Saída Digital (Alerta Visual)
+
+// ==========================================
+// 3. VARIÁVEIS DE CONTROLE DO SISTEMA
+// ==========================================
+// Flag para o sistema lembrar se o alarme estava tocando antes
+bool estadoPoluido = false; 
 
 // ==========================================
 // MÓDULO DE CONEXÃO WI-FI
@@ -49,7 +55,7 @@ void reconnect() {
   while (!client.connected()) {
     Serial.print("[INFO] Negociando conexao com Broker MQTT (EMQX)... ");
     
-    // Gera ID único para não cair a conexão
+    // Gera ID único para evitar queda de conexão por conflito
     String clientId = "Mackenzie-IoT-Node-";
     clientId += String(random(0, 1000));
     
@@ -73,8 +79,8 @@ void setup() {
   
   pinMode(pinLED, OUTPUT);
   servo.attach(pinServo);
-  servo.write(0); 
-
+  servo.write(0); // Garante que o sistema liga com a válvula fechada
+  
   setup_wifi();
   client.setServer(mqtt_server, mqtt_port);
   
@@ -85,35 +91,53 @@ void setup() {
 // LOOP DE CONTROLE PRINCIPAL
 // ==========================================
 void loop() {
+  // Mantém a conexão MQTT viva
   if (!client.connected()) {
     reconnect();
   }
   client.loop(); 
 
-  // Leitura e Conversão
+  // Leitura do sensor e conversão matemática para PPM (Partes por Milhão)
   int gasValueBruto = analogRead(pinSensor);
   long ppm = map(gasValueBruto, 0, 4095, 0, 10000);
   
-  // Limite configurado para o seu ambiente
+  // Define a partir de quantos PPM o sistema considera como vazamento perigoso
   const int limitePPM = 3000; 
 
+  // Lógica de Atuação e Telemetria
   if (ppm > limitePPM) {
-    servo.write(90);             
-    digitalWrite(pinLED, HIGH);  
+    servo.write(90);             // Abre a válvula
+    digitalWrite(pinLED, HIGH);  // Acende o LED de perigo
     
+    // Envia o JSON de emergência
     String payload = "{\"ppm\": " + String(ppm) + ", \"status\": \"poluido\"}";
     client.publish(topico_alerta, payload.c_str());
     
     Serial.print("[CRITICO] Risco! Nivel de gas: ");
     Serial.print(ppm);
-    Serial.println(" PPM. Valvula aberta. Payload enviado.");
+    Serial.println(" PPM. Valvula aberta.");
     
-    delay(2000); 
+    // Levanta a bandeira de perigo para o sistema "lembrar" do estado atual
+    estadoPoluido = true; 
+    
+    delay(2000); // Aguarda 2 segundos para não sobrecarregar o servidor (flood)
   } 
   else {
-    servo.write(0);              
-    digitalWrite(pinLED, LOW);   
+    servo.write(0);              // Fecha a válvula
+    digitalWrite(pinLED, LOW);   // Apaga o LED
+    
+    // Só envia a mensagem de estabilização SE o alarme estava acionado antes
+    if (estadoPoluido == true) {
+      // Envia o JSON informando que voltou ao normal
+      String payloadLimpo = "{\"ppm\": " + String(ppm) + ", \"status\": \"normal\"}";
+      client.publish(topico_alerta, payloadLimpo.c_str());
+      
+      Serial.println("[INFO] O ambiente foi estabilizado. Ar limpo. Valvula fechada.");
+      
+      // Abaixa a bandeira, pois o perigo já passou
+      estadoPoluido = false; 
+    }
   }
   
-  delay(500); 
+  delay(500); // Ciclo de amostragem (Lê o sensor a cada meio segundo)
 }
